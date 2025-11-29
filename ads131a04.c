@@ -1,8 +1,10 @@
 #include "ads131a04.h"
+
 #include "pico/stdlib.h"
 #include "hardware/spi.h"
 #include "hardware/gpio.h"
 #include "hardware/dma.h"
+#include "hardware/irq.h"
 #include <stdio.h>
 
 static int32_t sign_extend24(uint32_t v) {
@@ -15,8 +17,21 @@ static int32_t sign_extend24(uint32_t v) {
 // DMA channels and buffers
 static int dma_tx_chan = -1;
 static int dma_rx_chan = -1;
-static uint8_t tx_buf[15];
-static uint8_t rx_buf[15];
+static uint8_t tx_dummy[ADS131_FRAME_BYTES];
+
+// Shared frame buffers
+static ads131_frame_buffers_t g_buffers;
+
+// Simple flag to indicate DMA in progress
+static volatile bool g_dma_busy = false;
+
+// Forward declarations for IRQ handlers
+static void ads131_dma_irq_handler(void);
+static void ads131_gpio_irq_callback(uint gpio, uint32_t events);
+
+ads131_frame_buffers_t *ads131_get_frame_buffers(void) {
+    return &g_buffers;
+}
 
 static void ads_spi_init(void) {
     // 24 MHz SPI clock (ADS131A04 supports up to 25 MHz)
@@ -43,9 +58,9 @@ static void ads_spi_init(void) {
     gpio_init(ADS_PIN_DRDY);
     gpio_set_dir(ADS_PIN_DRDY, GPIO_IN);
 
-    // Prepare TX buffer with zeros (we only need clocks)
-    for (int i = 0; i < 15; ++i) {
-        tx_buf[i] = 0;
+    // Prepare TX dummy buffer (we only need clocks)
+    for (int i = 0; i < ADS131_FRAME_BYTES; ++i) {
+        tx_dummy[i] = 0;
     }
 
     // Setup DMA channels
@@ -61,7 +76,7 @@ static void ads_spi_init(void) {
         dma_tx_chan,
         &c_tx,
         &spi_get_hw(ADS_SPI_PORT)->dr, // write to SPI DR
-        tx_buf,                        // from TX buffer
+        tx_dummy,                      // from dummy buffer
         0,                             // count set per transfer
         false                          // don't start yet
     );
@@ -74,11 +89,24 @@ static void ads_spi_init(void) {
     dma_channel_configure(
         dma_rx_chan,
         &c_rx,
-        rx_buf,                        // write to RX buffer
+        NULL,                          // dest set per transfer
         &spi_get_hw(ADS_SPI_PORT)->dr, // read from SPI DR
         0,                             // count set per transfer
         false                          // don't start yet
     );
+
+    // Enable DMA IRQ0 for RX channel
+    dma_channel_set_irq0_enabled(dma_rx_chan, true);
+    irq_set_exclusive_handler(DMA_IRQ_0, ads131_dma_irq_handler);
+    irq_set_enabled(DMA_IRQ_0, true);
+
+    // Initialize buffer state
+    g_buffers.write_index = 0;
+    g_buffers.active_buffer = 0;
+    g_buffers.buffer_full[0] = false;
+    g_buffers.buffer_full[1] = false;
+    g_buffers.total_frames = 0;
+    g_buffers.overrun_frames = 0;
 }
 
 // Send 16-bit command framed as 3 bytes (as in the working version)
@@ -168,50 +196,84 @@ ads131_status_t ads131_init(void) {
     return ADS131_OK;
 }
 
-bool ads131_read_frame_dma(uint16_t *status_word, int32_t ch[4]) {
-    if (!status_word || !ch) return false;
+// DMA IRQ handler: called when RX DMA has completed one frame
+static void ads131_dma_irq_handler(void) {
+    // Check and clear IRQ for our RX channel
+    uint32_t ints = dma_hw->ints0;
+    if (ints & (1u << dma_rx_chan)) {
+        dma_hw->ints0 = (1u << dma_rx_chan);
 
-    // Wait for DRDY to go low (new data)
-    const uint32_t timeout_us = 10000; // ~100 us timeout
-    volatile uint32_t waited = 0;
-    while (gpio_get(ADS_PIN_DRDY)) {
-        //sleep_us(1);
-        if (++waited >= timeout_us) {
-            return false;
+        // End of frame: deassert CS
+        gpio_put(ADS_PIN_CS, 1);
+
+        // Update buffer state
+        uint32_t buf = g_buffers.active_buffer;
+        uint32_t idx = g_buffers.write_index;
+
+        g_buffers.total_frames++;
+
+        idx++;
+        if (idx >= ADS131_FRAMES_PER_BUFFER) {
+            g_buffers.buffer_full[buf] = true;
+            // Switch to other buffer
+            g_buffers.active_buffer = (buf ^ 1u);
+            idx = 0;
         }
+        g_buffers.write_index = idx;
+
+        g_dma_busy = false;
+    }
+}
+
+// GPIO IRQ callback for DRDY falling edge: start a new DMA transfer if idle
+static void ads131_gpio_irq_callback(uint gpio, uint32_t events) {
+    if (gpio != ADS_PIN_DRDY) {
+        return;
+    }
+    if (!(events & GPIO_IRQ_EDGE_FALL)) {
+        return;
     }
 
-    // Configure DMA transfer count to 15 bytes
-    dma_channel_set_trans_count(dma_tx_chan, 15, false);
-    dma_channel_set_trans_count(dma_rx_chan, 15, false);
+    if (g_dma_busy) {
+        // We are still transferring previous frame -> overrun
+        g_buffers.overrun_frames++;
+        return;
+    }
 
-    // Reset RX buffer (not strictly necessary, but good for debugging)
-    // for (int i = 0; i < 15; ++i) rx_buf[i] = 0;
+    // Start a new frame DMA transfer
+    uint32_t buf = g_buffers.active_buffer;
+    uint32_t idx = g_buffers.write_index;
 
-    // Set up addresses (they remain the same, but this is cheap)
-    dma_channel_set_read_addr(dma_tx_chan, tx_buf, false);
+    if (idx >= ADS131_FRAMES_PER_BUFFER) {
+        // Should be handled in DMA handler, but guard anyway
+        return;
+    }
+
+    uint8_t *dest = g_buffers.frames[buf][idx];
+
+    // Configure DMA for this frame
+    dma_channel_set_trans_count(dma_tx_chan, ADS131_FRAME_BYTES, false);
+    dma_channel_set_trans_count(dma_rx_chan, ADS131_FRAME_BYTES, false);
+
+    dma_channel_set_read_addr(dma_tx_chan, tx_dummy, false);
     dma_channel_set_write_addr(dma_tx_chan, &spi_get_hw(ADS_SPI_PORT)->dr, false);
-    dma_channel_set_read_addr(dma_rx_chan, &spi_get_hw(ADS_SPI_PORT)->dr, false);
-    dma_channel_set_write_addr(dma_rx_chan, rx_buf, false);
 
-    // Start RX first, then TX
+    dma_channel_set_read_addr(dma_rx_chan, &spi_get_hw(ADS_SPI_PORT)->dr, false);
+    dma_channel_set_write_addr(dma_rx_chan, dest, false);
+
+    g_dma_busy = true;
+
+    // Assert CS and start DMA transfers
     gpio_put(ADS_PIN_CS, 0);
     dma_start_channel_mask((1u << dma_rx_chan) | (1u << dma_tx_chan));
+}
 
-    // Wait for RX to complete
-    dma_channel_wait_for_finish_blocking(dma_rx_chan);
-    gpio_put(ADS_PIN_CS, 1);
-
-    // Parse frame: first 2 bytes status, then 4x24-bit channels
-    *status_word = (uint16_t)((rx_buf[0] << 8) | rx_buf[1]);
-
-    for (int i = 0; i < 4; ++i) {
-        int base = 2 + 3 * i;
-        uint32_t raw24 = ((uint32_t)rx_buf[base] << 16) |
-                         ((uint32_t)rx_buf[base + 1] << 8) |
-                         ((uint32_t)rx_buf[base + 2]);
-        ch[i] = sign_extend24(raw24);
-    }
-
-    return true;
+void ads131_start_continuous_capture(void) {
+    // Configure DRDY GPIO interrupt on falling edge
+    gpio_set_irq_enabled_with_callback(
+        ADS_PIN_DRDY,
+        GPIO_IRQ_EDGE_FALL,
+        true,
+        &ads131_gpio_irq_callback
+    );
 }

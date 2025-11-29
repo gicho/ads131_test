@@ -5,7 +5,7 @@
 int main(void) {
     stdio_init_all();
 
-    // USB bring-up
+    // Allow USB CDC to come up
     for (int i = 0; i < 10; ++i) {
         printf("Tick %d\r\n", i);
         sleep_ms(500);
@@ -28,47 +28,47 @@ int main(void) {
     printf("ID_MSB = 0x%02X  ID_LSB = 0x%02X  STAT_M2 = 0x%02X\r\n",
            id_msb, id_lsb, stat_m2);
 
-    const uint32_t N_SAMPLES = 1024;
-    uint32_t batch = 0;
+    // Start continuous capture using DRDY IRQ + SPI DMA into double buffer
+    ads131_start_continuous_capture();
+    printf("Continuous capture started (DRDY IRQ + DMA) ...\r\n");
 
-    printf("Starting DMA throughput benchmark: N=%u frames per batch\r\n", N_SAMPLES);
-    printf("Each frame = status + 4x24-bit channels (15 bytes clocked)\r\n");
+    ads131_frame_buffers_t *fb = ads131_get_frame_buffers();
+
+    uint64_t last_total_frames = 0;
+    absolute_time_t last_time = get_absolute_time();
 
     while (true) {
-        uint32_t ok = 0;
-        uint32_t timeouts = 0;
-        uint16_t status = 0;
-        int32_t ch[4];
+        sleep_ms(1000);
 
-        uint64_t t0 = time_us_64();
-        for (uint32_t i = 0; i < N_SAMPLES; ++i) {
-            if (ads131_read_frame_dma(&status, ch)) {
-                ok++;
-            } else {
-                timeouts++;
+        uint64_t current_total = fb->total_frames;
+        uint64_t delta_frames = current_total - last_total_frames;
+        last_total_frames = current_total;
+
+        absolute_time_t now = get_absolute_time();
+        int64_t dt_us = absolute_time_diff_us(last_time, now);
+        last_time = now;
+
+        double rate = 0.0;
+        if (dt_us > 0) {
+            rate = (double)delta_frames * 1e6 / (double)dt_us;
+        }
+
+        printf("Frames: total=%llu  overrun=%llu  delta=%llu  dt=%lld us  rate=%.1f SPS\r\n",
+               (unsigned long long)fb->total_frames,
+               (unsigned long long)fb->overrun_frames,
+               (unsigned long long)delta_frames,
+               (long long)dt_us,
+               rate);
+
+        // Optionally, check buffer_full flags and do something with data here.
+        for (int b = 0; b < ADS131_NUM_BUFFERS; ++b) {
+            if (fb->buffer_full[b]) {
+                printf("Buffer %d full (contains %d frames)\r\n",
+                       b, ADS131_FRAMES_PER_BUFFER);
+                // TODO: process or stream buffer fb->frames[b][...]
+                fb->buffer_full[b] = false;
             }
         }
-        uint64_t t1 = time_us_64();
-        uint64_t dt_us = t1 - t0;
-
-        uint64_t rate_x10 = 0;
-        if (dt_us > 0 && ok > 0) {
-            rate_x10 = (uint64_t)ok * 10000000ull / dt_us;
-        }
-        uint32_t sps_int = (uint32_t)(rate_x10 / 10);
-        uint32_t sps_frac = (uint32_t)(rate_x10 % 10);
-
-        printf("Batch %lu: N=%u ok=%u timeouts=%u dt=%llu us  rate=%lu.%lu SPS\r\n",
-               (unsigned long)batch,
-               N_SAMPLES,
-               ok,
-               timeouts,
-               (unsigned long long)dt_us,
-               (unsigned long)sps_int,
-               (unsigned long)sps_frac);
-
-        batch++;
-        sleep_ms(500);
     }
 
     return 0;

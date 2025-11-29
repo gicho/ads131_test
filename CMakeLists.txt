@@ -38,6 +38,7 @@ target_link_libraries(ads131_dma_bench
     pico_stdlib
     hardware_spi
     hardware_dma
+    hardware_irq
 )
 
 pico_enable_stdio_usb(ads131_dma_bench 1)

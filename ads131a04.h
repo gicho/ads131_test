@@ -52,8 +52,29 @@ ads131_status_t ads131_init(void);
 bool ads131_read_reg(uint8_t addr, uint8_t *value);
 bool ads131_write_reg(uint8_t addr, uint8_t value);
 
-// DMA-based frame read: status + 4x24-bit channels
-// Returns true on success, false on DRDY timeout
-bool ads131_read_frame_dma(uint16_t *status_word, int32_t ch[4]);
+// Frame definitions: raw 15-byte SPI frame
+#define ADS131_FRAME_BYTES 15
+
+// Double-buffer parameters
+#define ADS131_FRAMES_PER_BUFFER 1024
+#define ADS131_NUM_BUFFERS       2
+
+typedef struct {
+    // Two buffers of raw frames: [buffer][frame][byte]
+    uint8_t frames[ADS131_NUM_BUFFERS][ADS131_FRAMES_PER_BUFFER][ADS131_FRAME_BYTES];
+
+    // State for producer side (ISR/DMA)
+    volatile uint32_t write_index;        // index within active buffer
+    volatile uint32_t active_buffer;      // 0 or 1
+    volatile bool buffer_full[ADS131_NUM_BUFFERS];
+    volatile uint64_t total_frames;       // total frames successfully captured
+    volatile uint64_t overrun_frames;     // DRDY while DMA busy
+} ads131_frame_buffers_t;
+
+// Global access to frame buffers state
+ads131_frame_buffers_t *ads131_get_frame_buffers(void);
+
+// Initialize ISR/DMA-based continuous capture
+void ads131_start_continuous_capture(void);
 
 #endif // ADS131A04_H
