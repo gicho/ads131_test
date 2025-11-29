@@ -4,10 +4,6 @@
 #include <stdint.h>
 #include <stdbool.h>
 
-#ifdef __cplusplus
-extern "C" {
-#endif
-
 // GPIO / SPI mapping for Pico 2 (RP2350)
 #define ADS_SPI_PORT   spi0
 #define ADS_PIN_MISO   16
@@ -56,12 +52,8 @@ ads131_status_t ads131_init(void);
 bool ads131_read_reg(uint8_t addr, uint8_t *value);
 bool ads131_write_reg(uint8_t addr, uint8_t value);
 
-// Read one conversion frame: status + 4x24-bit channels
+// DMA-based frame read: status + 4x24-bit channels
 // Returns true on success, false on DRDY timeout
-bool ads131_read_frame(uint16_t *status_word, int32_t ch[4]);
-
-#ifdef __cplusplus
-}
-#endif
+bool ads131_read_frame_dma(uint16_t *status_word, int32_t ch[4]);
 
 #endif // ADS131A04_H

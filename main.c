@@ -31,7 +31,7 @@ int main(void) {
     const uint32_t N_SAMPLES = 1024;
     uint32_t batch = 0;
 
-    printf("Starting throughput benchmark: N=%u frames per batch\r\n", N_SAMPLES);
+    printf("Starting DMA throughput benchmark: N=%u frames per batch\r\n", N_SAMPLES);
     printf("Each frame = status + 4x24-bit channels (15 bytes clocked)\r\n");
 
     while (true) {
@@ -42,7 +42,7 @@ int main(void) {
 
         uint64_t t0 = time_us_64();
         for (uint32_t i = 0; i < N_SAMPLES; ++i) {
-            if (ads131_read_frame(&status, ch)) {
+            if (ads131_read_frame_dma(&status, ch)) {
                 ok++;
             } else {
                 timeouts++;

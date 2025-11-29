@@ -2,6 +2,7 @@
 #include "pico/stdlib.h"
 #include "hardware/spi.h"
 #include "hardware/gpio.h"
+#include "hardware/dma.h"
 #include <stdio.h>
 
 static int32_t sign_extend24(uint32_t v) {
@@ -11,8 +12,14 @@ static int32_t sign_extend24(uint32_t v) {
     return (int32_t)v;
 }
 
+// DMA channels and buffers
+static int dma_tx_chan = -1;
+static int dma_rx_chan = -1;
+static uint8_t tx_buf[15];
+static uint8_t rx_buf[15];
+
 static void ads_spi_init(void) {
-    // 16 MHz SPI clock (ADS131A04 supports up to 25 MHz)
+    // 24 MHz SPI clock (ADS131A04 supports up to 25 MHz)
     spi_init(ADS_SPI_PORT, 24 * 1000 * 1000);
 
     spi_set_format(ADS_SPI_PORT,
@@ -35,6 +42,43 @@ static void ads_spi_init(void) {
 
     gpio_init(ADS_PIN_DRDY);
     gpio_set_dir(ADS_PIN_DRDY, GPIO_IN);
+
+    // Prepare TX buffer with zeros (we only need clocks)
+    for (int i = 0; i < 15; ++i) {
+        tx_buf[i] = 0;
+    }
+
+    // Setup DMA channels
+    dma_tx_chan = dma_claim_unused_channel(true);
+    dma_rx_chan = dma_claim_unused_channel(true);
+
+    dma_channel_config c_tx = dma_channel_get_default_config(dma_tx_chan);
+    channel_config_set_transfer_data_size(&c_tx, DMA_SIZE_8);
+    channel_config_set_read_increment(&c_tx, true);
+    channel_config_set_write_increment(&c_tx, false);
+    channel_config_set_dreq(&c_tx, spi_get_dreq(ADS_SPI_PORT, true)); // TX DREQ
+    dma_channel_configure(
+        dma_tx_chan,
+        &c_tx,
+        &spi_get_hw(ADS_SPI_PORT)->dr, // write to SPI DR
+        tx_buf,                        // from TX buffer
+        0,                             // count set per transfer
+        false                          // don't start yet
+    );
+
+    dma_channel_config c_rx = dma_channel_get_default_config(dma_rx_chan);
+    channel_config_set_transfer_data_size(&c_rx, DMA_SIZE_8);
+    channel_config_set_read_increment(&c_rx, false);
+    channel_config_set_write_increment(&c_rx, true);
+    channel_config_set_dreq(&c_rx, spi_get_dreq(ADS_SPI_PORT, false)); // RX DREQ
+    dma_channel_configure(
+        dma_rx_chan,
+        &c_rx,
+        rx_buf,                        // write to RX buffer
+        &spi_get_hw(ADS_SPI_PORT)->dr, // read from SPI DR
+        0,                             // count set per transfer
+        false                          // don't start yet
+    );
 }
 
 // Send 16-bit command framed as 3 bytes (as in the working version)
@@ -44,12 +88,12 @@ static void ads_spi_write_cmd16(uint16_t cmd) {
         (uint8_t)(cmd & 0xFF),
         0x00
     };
+    uint8_t rx[3] = {0};
     gpio_put(ADS_PIN_CS, 0);
-    spi_write_blocking(ADS_SPI_PORT, tx, 3);
+    spi_write_read_blocking(ADS_SPI_PORT, tx, rx, 3);
     gpio_put(ADS_PIN_CS, 1);
 }
 
-// Clock out 3 bytes of zeros and read back 3 bytes, return top 16 bits
 static uint16_t ads_spi_null_and_read16(void) {
     uint8_t tx[3] = {0, 0, 0};
     uint8_t rx[3] = {0, 0, 0};
@@ -69,7 +113,7 @@ bool ads131_read_reg(uint8_t addr, uint8_t *value) {
 
 bool ads131_write_reg(uint8_t addr, uint8_t value) {
     ads_spi_write_cmd16(ads131_cmd_wreg(addr, value));
-    (void)ads_spi_null_and_read16(); // ignore response for now
+    (void)ads_spi_null_and_read16(); // ignore response
     return true;
 }
 
@@ -90,7 +134,6 @@ ads131_status_t ads131_init(void) {
     ads_spi_write_cmd16(ADS131_CMD_UNLOCK);
     uint16_t unlock_ack = ads_spi_null_and_read16();
     printf("UNLOCK ack = 0x%04X\r\n", unlock_ack);
-    // The device echoes the last command word; check upper bits loosely
     if ((unlock_ack & 0xFF00u) != (ADS131_CMD_UNLOCK & 0xFF00u)) {
         return ADS131_ERR_UNLOCK;
     }
@@ -103,9 +146,8 @@ ads131_status_t ads131_init(void) {
         return ADS131_ERR_WAKEUP;
     }
 
-    // Configure clocking for high data rate using 16.384 MHz CLKIN.
-    // Example: CLKSRC=0 (XTAL1/CLKIN), CLK_DIV=2 (0010b) => fICLK = fCLKIN/2
-    // CLK2: ICLK_DIV=001b, OSR=1111b => max ODR ~128 kSPS
+    // Configure clocking for max ODR with 16.384 MHz CLKIN:
+    // CLK1=0x02, CLK2=0x2F -> ~128 kSPS
     if (!ads131_write_reg(ADS131_REG_CLK1, 0x02)) {
         return ADS131_ERR_SPI;
     }
@@ -126,33 +168,48 @@ ads131_status_t ads131_init(void) {
     return ADS131_OK;
 }
 
-bool ads131_read_frame(uint16_t *status_word, int32_t ch[4]) {
+bool ads131_read_frame_dma(uint16_t *status_word, int32_t ch[4]) {
     if (!status_word || !ch) return false;
 
     // Wait for DRDY to go low (new data)
-    const uint32_t timeout_us = 100; // ~100 us timeout
-    uint32_t waited = 0;
+    const uint32_t timeout_us = 10000; // ~100 us timeout
+    volatile uint32_t waited = 0;
     while (gpio_get(ADS_PIN_DRDY)) {
-        sleep_us(1);
+        //sleep_us(1);
         if (++waited >= timeout_us) {
             return false;
         }
     }
 
-    uint8_t tx[15] = {0};
-    uint8_t rx[15] = {0};
+    // Configure DMA transfer count to 15 bytes
+    dma_channel_set_trans_count(dma_tx_chan, 15, false);
+    dma_channel_set_trans_count(dma_rx_chan, 15, false);
 
+    // Reset RX buffer (not strictly necessary, but good for debugging)
+    // for (int i = 0; i < 15; ++i) rx_buf[i] = 0;
+
+    // Set up addresses (they remain the same, but this is cheap)
+    dma_channel_set_read_addr(dma_tx_chan, tx_buf, false);
+    dma_channel_set_write_addr(dma_tx_chan, &spi_get_hw(ADS_SPI_PORT)->dr, false);
+    dma_channel_set_read_addr(dma_rx_chan, &spi_get_hw(ADS_SPI_PORT)->dr, false);
+    dma_channel_set_write_addr(dma_rx_chan, rx_buf, false);
+
+    // Start RX first, then TX
     gpio_put(ADS_PIN_CS, 0);
-    spi_write_read_blocking(ADS_SPI_PORT, tx, rx, 15);
+    dma_start_channel_mask((1u << dma_rx_chan) | (1u << dma_tx_chan));
+
+    // Wait for RX to complete
+    dma_channel_wait_for_finish_blocking(dma_rx_chan);
     gpio_put(ADS_PIN_CS, 1);
 
-    *status_word = (uint16_t)((rx[0] << 8) | rx[1]);
+    // Parse frame: first 2 bytes status, then 4x24-bit channels
+    *status_word = (uint16_t)((rx_buf[0] << 8) | rx_buf[1]);
 
     for (int i = 0; i < 4; ++i) {
-        int base = (i + 1) * 3;
-        uint32_t raw24 = ((uint32_t)rx[base] << 16) |
-                         ((uint32_t)rx[base + 1] << 8) |
-                         ((uint32_t)rx[base + 2]);
+        int base = 2 + 3 * i;
+        uint32_t raw24 = ((uint32_t)rx_buf[base] << 16) |
+                         ((uint32_t)rx_buf[base + 1] << 8) |
+                         ((uint32_t)rx_buf[base + 2]);
         ch[i] = sign_extend24(raw24);
     }
 
