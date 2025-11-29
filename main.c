@@ -30,7 +30,7 @@ int main(void) {
 
     // Start continuous capture using DRDY IRQ + SPI DMA into double buffer
     ads131_start_continuous_capture();
-    printf("Continuous capture started (DRDY IRQ + DMA) ...\r\n");
+    printf("Continuous capture started (DRDY IRQ + DMA, prioritized) ...\r\n");
 
     ads131_frame_buffers_t *fb = ads131_get_frame_buffers();
 
@@ -60,7 +60,6 @@ int main(void) {
                (long long)dt_us,
                rate);
 
-        // Optionally, check buffer_full flags and do something with data here.
         for (int b = 0; b < ADS131_NUM_BUFFERS; ++b) {
             if (fb->buffer_full[b]) {
                 printf("Buffer %d full (contains %d frames)\r\n",
