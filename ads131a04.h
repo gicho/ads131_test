@@ -46,13 +46,32 @@ typedef enum {
     ADS131_ERR_SPI
 } ads131_status_t;
 
-// Simple PIO frame layout (128 bits => 4x 32-bit words)
-#define ADS131_WORDS_PER_FRAME   4
+// PIO+DMA frame layout
+#define ADS131_WORDS_PER_FRAME   5
+#define ADS131_FRAMES_PER_BUFFER 1024
+#define ADS131_NUM_BUFFERS       2
+
+typedef struct {
+    // Raw data: [buffer][frame][word]
+    uint32_t frames[ADS131_NUM_BUFFERS]
+                   [ADS131_FRAMES_PER_BUFFER]
+                   [ADS131_WORDS_PER_FRAME];
+
+    volatile bool     buffer_full[ADS131_NUM_BUFFERS];
+    volatile uint64_t total_frames;   // total frames captured (all buffers)
+    volatile uint64_t dma_errors;     // reserved for future use
+} ads131_frame_buffers_t;
 
 // SPI-based init: reset, unlock, wakeup, clock config, channel enable
 ads131_status_t ads131_init(void);
 
-// Start simple PIO capture (no DMA): blocking loop printing frames & rate
-void ads131_start_pio_simple_capture(void);
+// Access to global frame buffers
+ads131_frame_buffers_t *ads131_get_frame_buffers(void);
+
+// Start continuous PIO+DMA double-buffered capture
+void ads131_start_pio_dma_capture(void);
+
+// Debug helper: read remaining transfer counts for both DMA channels
+void ads131_get_dma_counts(uint32_t *a_count, uint32_t *b_count);
 
 #endif // ADS131A04_H

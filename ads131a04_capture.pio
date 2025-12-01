@@ -1,33 +1,39 @@
 .program ads131a04_capture
-.side_set 1 opt
+.side_set 1
 
-; PIO program to read one ADS131A04 frame (status + 4x24b = 128 bits)
-; Assumptions:
-; - SCK is sideset pin
-; - CS is in SET pin group (width=1)
-; - MISO is IN base pin
-; - DRDY is GPIO 20 (wait 0 gpio 20)
+; PIO Clock: 100 MHz (CLKDIV=1.25) -> SPI Clock: 25 MHz, 50% duty
 
 .wrap_target
-wait_drdy:
-    ; Wait for DRDY (GPIO20) to go low, SCK low
-    wait 0 gpio 20     side 0
+    ; 1a. FIX: Wait for DRDY to go HIGH (Inactive/Idle state).
+    ; This ensures the SM pauses and respects the full ADC sample period.
+    wait 1 gpio 20      side 0 
 
-    ; Assert CS low
-    set pins, 0b0      side 0
+    ; 1b. Wait for DRDY to go LOW (New data ready trigger).
+    wait 0 gpio 20      side 0 
 
-    ; 128 bits total -> 4 * 32-bit words
-    set y, 3           ; outer loop: 4 iterations (3,2,1,0)
-outer:
-    set x, 31          ; inner loop: 32 bits
+    ; 2. Assert CS LOW
+    set pins, 0         side 0
 
-bitloop:
-    in pins, 1         side 1   ; SCK high, sample MISO
-    nop                side 0   ; SCK low
-    jmp x-- bitloop             ; 32 bits/word
+    ; 3. Loop 5 times (Status + 4 Channels)
+    set y, 4            side 0  
 
-    jmp y-- outer               ; 4 words/frame
+word_loop:
+    set x, 23           side 0  
 
-    ; Deassert CS
-    set pins, 0b1      side 0
+bit_loop:
+    ; SCK HIGH (2 PIO cycles)
+    in pins, 1          side 1
+    nop                 side 1
+
+    ; SCK LOW (2 PIO cycles)
+    nop                 side 0
+    jmp x-- bit_loop    side 0
+
+    ; 4. Final Alignment & Push (Stalls if RX FIFO is full)
+    push block          side 0  
+
+    jmp y-- word_loop   side 0  
+
+    ; 5. Deassert CS HIGH
+    set pins, 1         side 0
 .wrap
