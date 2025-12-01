@@ -4,7 +4,7 @@
 #include <stdint.h>
 #include <stdbool.h>
 
-// GPIO / SPI mapping for Pico 2 (RP2350)
+// Pin mapping (same as before, but now used by PIO for data)
 #define ADS_SPI_PORT   spi0
 #define ADS_PIN_MISO   16
 #define ADS_PIN_CS     17
@@ -30,7 +30,6 @@
 #define ADS131_REG_CLK2      0x0E
 #define ADS131_REG_ADC_ENA   0x0F
 
-// Build RREG / WREG command (single register)
 static inline uint16_t ads131_cmd_rreg(uint8_t addr) {
     uint8_t msb = 0x20u | (addr & 0x1Fu);
     return (uint16_t)msb << 8;
@@ -40,7 +39,6 @@ static inline uint16_t ads131_cmd_wreg(uint8_t addr, uint8_t data) {
     return ((uint16_t)msb << 8) | data;
 }
 
-// Status codes for init
 typedef enum {
     ADS131_OK = 0,
     ADS131_ERR_UNLOCK,
@@ -48,33 +46,28 @@ typedef enum {
     ADS131_ERR_SPI
 } ads131_status_t;
 
-ads131_status_t ads131_init(void);
-bool ads131_read_reg(uint8_t addr, uint8_t *value);
-bool ads131_write_reg(uint8_t addr, uint8_t value);
-
-// Frame definitions: raw 15-byte SPI frame
-#define ADS131_FRAME_BYTES 15
-
-// Double-buffer parameters
+// Simple frame parameters for PIO+DMA:
+// We oversample 128 bits per frame -> 4x 32-bit words
+#define ADS131_WORDS_PER_FRAME   4
 #define ADS131_FRAMES_PER_BUFFER 1024
 #define ADS131_NUM_BUFFERS       2
 
 typedef struct {
-    // Two buffers of raw frames: [buffer][frame][byte]
-    uint8_t frames[ADS131_NUM_BUFFERS][ADS131_FRAMES_PER_BUFFER][ADS131_FRAME_BYTES];
+    // Two buffers of raw 32-bit words: [buffer][frame][word]
+    uint32_t frames[ADS131_NUM_BUFFERS][ADS131_FRAMES_PER_BUFFER][ADS131_WORDS_PER_FRAME];
 
-    // State for producer side (ISR/DMA)
-    volatile uint32_t write_index;        // index within active buffer
-    volatile uint32_t active_buffer;      // 0 or 1
     volatile bool buffer_full[ADS131_NUM_BUFFERS];
-    volatile uint64_t total_frames;       // total frames successfully captured
-    volatile uint64_t overrun_frames;     // DRDY while DMA busy
+    volatile uint64_t total_frames;      // total frames captured
+    volatile uint64_t dma_errors;        // optional error counter
 } ads131_frame_buffers_t;
 
-// Global access to frame buffers state
+ads131_status_t ads131_init(void); // SPI-based init (reset, unlock, wakeup, CLK, channel enable)
+
 ads131_frame_buffers_t *ads131_get_frame_buffers(void);
 
-// Initialize ISR/DMA-based continuous capture
-void ads131_start_continuous_capture(void);
+void ads131_get_dma_counts(uint32_t *a_count, uint32_t *b_count);
+
+// Initialize and start PIO+DMA double-buffered capture
+void ads131_start_pio_dma_capture(void);
 
 #endif // ADS131A04_H

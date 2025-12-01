@@ -30,6 +30,8 @@ add_executable(ads131_dma_bench
     ads131a04.c
 )
 
+pico_generate_pio_header(ads131_dma_bench ${CMAKE_CURRENT_LIST_DIR}/ads131a04_capture.pio)
+
 target_include_directories(ads131_dma_bench PRIVATE
     ${CMAKE_CURRENT_LIST_DIR}
 )
@@ -38,7 +40,9 @@ target_link_libraries(ads131_dma_bench
     pico_stdlib
     hardware_spi
     hardware_dma
+    hardware_pio
     hardware_irq
+    hardware_clocks
 )
 
 pico_enable_stdio_usb(ads131_dma_bench 1)

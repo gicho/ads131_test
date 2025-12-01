@@ -1,0 +1,26 @@
+.program ads131a04_capture
+.side_set 1 opt
+
+.wrap_target
+wait_drdy:
+    ; Wait for DRDY (mapped as jmp_pin) to go low, keep SCK low
+    wait 0 pin 0       side 0
+
+    ; Assert CS low (CS is on SET pin group, 1 bit wide)
+    set pins, 0b0      side 0
+
+    ; We want 128 bits total -> 4 chunks of 32 bits
+    set y, 3           ; outer loop: 4 iterations (3,2,1,0)
+outer:
+    set x, 31          ; inner loop: 32 bits
+
+bitloop:
+    in pins, 1         side 1   ; SCK high, shift 1 bit from MISO
+    nop                side 0   ; SCK low
+    jmp x-- bitloop             ; loop 32 times
+
+    jmp y-- outer               ; loop 4 times (4×32 = 128 bits)
+
+    ; After 128 bits: deassert CS
+    set pins, 0b1      side 0
+.wrap
