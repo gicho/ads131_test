@@ -3,26 +3,17 @@
 #include "pico/stdlib.h"
 #include "hardware/spi.h"
 #include "hardware/gpio.h"
-#include "hardware/dma.h"
 #include "hardware/pio.h"
-#include "hardware/irq.h"
 #include "hardware/clocks.h"
 #include <stdio.h>
 
 #include "ads131a04_capture.pio.h"
 
-static int32_t sign_extend24(uint32_t v) {
-    if (v & 0x800000u) {
-        v |= 0xFF000000u;
-    }
-    return (int32_t)v;
-}
-
 // --- SPI helper functions for register access (used only during init) ---
 
 static void ads_spi_init_for_config(void) {
     // Basic SPI0 config for ADS131A04 register access
-    spi_init(ADS_SPI_PORT, 4 * 1000 * 1000); // 4 MHz
+    spi_init(ADS_SPI_PORT, 24 * 1000 * 1000); // 4 MHz
 
     spi_set_format(ADS_SPI_PORT,
                    8,          // bits per transfer
@@ -47,13 +38,16 @@ static void ads_spi_init_for_config(void) {
 }
 
 static void ads_spi_deinit_after_config(void) {
+    // Return pins to GPIO; PIO will reassign them later
     spi_deinit(ADS_SPI_PORT);
 
-    // Return pins to GPIO; PIO will claim them next
     gpio_set_function(ADS_PIN_MISO, GPIO_FUNC_SIO);
     gpio_set_function(ADS_PIN_MOSI, GPIO_FUNC_SIO);
     gpio_set_function(ADS_PIN_SCK,  GPIO_FUNC_SIO);
-    gpio_set_function(ADS_PIN_CS,   GPIO_FUNC_SIO);
+
+    // Make sure CS is high and under GPIO control before PIO grabs it
+    gpio_put(ADS_PIN_CS, 1);
+    gpio_set_function(ADS_PIN_CS, GPIO_FUNC_SIO);
 }
 
 static void ads_spi_write_cmd16(uint16_t cmd) {
@@ -157,66 +151,20 @@ ads131_status_t ads131_init(void) {
     return ADS131_OK;
 }
 
-// --- PIO + DMA double-buffered capture ---
+// --- Simple PIO-only capture (no DMA) for debugging ---
 
-static ads131_frame_buffers_t g_buffers;
+void ads131_start_pio_simple_capture(void) {
+    PIO  pio = pio0;
+    uint sm  = 0;
 
-static PIO  g_pio        = pio0;
-static uint g_sm         = 0;
-static uint g_pio_offset = 0;
-
-static int  g_dma_chan_a = -1;
-static int  g_dma_chan_b = -1;
-
-// Access to buffers from main.c
-ads131_frame_buffers_t *ads131_get_frame_buffers(void) {
-    return &g_buffers;
-}
-
-// Debug helper: remaining DMA transfer counts
-void ads131_get_dma_counts(uint32_t *a_count, uint32_t *b_count) {
-    if (a_count && g_dma_chan_a >= 0) {
-        *a_count = dma_channel_hw_addr(g_dma_chan_a)->transfer_count;
-    }
-    if (b_count && g_dma_chan_b >= 0) {
-        *b_count = dma_channel_hw_addr(g_dma_chan_b)->transfer_count;
-    }
-}
-
-static void __not_in_flash_func(ads131_dma_irq_handler)(void) {
-    uint32_t ints = dma_hw->ints0;
-
-    if (ints & (1u << g_dma_chan_a)) {
-        dma_hw->ints0 = (1u << g_dma_chan_a);      // clear IRQ
-        g_buffers.buffer_full[0] = true;
-        g_buffers.total_frames += ADS131_FRAMES_PER_BUFFER;
-    }
-    if (ints & (1u << g_dma_chan_b)) {
-        dma_hw->ints0 = (1u << g_dma_chan_b);      // clear IRQ
-        g_buffers.buffer_full[1] = true;
-        g_buffers.total_frames += ADS131_FRAMES_PER_BUFFER;
-    }
-}
-
-// Initialize PIO SM and DMA ping-pong for continuous capture
-void ads131_start_pio_dma_capture(void) {
-    for (int b = 0; b < ADS131_NUM_BUFFERS; ++b) {
-        g_buffers.buffer_full[b] = false;
-    }
-    g_buffers.total_frames = 0;
-    g_buffers.dma_errors   = 0;
-
-    // Load PIO program
-    g_sm = 0;
-    g_pio_offset = pio_add_program(g_pio, &ads131a04_capture_program);
-
-    pio_sm_config c = ads131a04_capture_program_get_default_config(g_pio_offset);
+    // Load program
+    uint offset = pio_add_program(pio, &ads131a04_capture_program);
+    pio_sm_config c = ads131a04_capture_program_get_default_config(offset);
 
     // Map pins:
     // - SCK as sideset
     // - CS as SET pin (1 bit)
     // - MISO as IN base
-    // DRDY is handled by "wait 0 gpio 20" in the PIO program (no jmp_pin needed)
     sm_config_set_sideset_pins(&c, ADS_PIN_SCK);
     sm_config_set_set_pins(&c, ADS_PIN_CS, 1);
     sm_config_set_in_pins(&c, ADS_PIN_MISO);
@@ -225,77 +173,65 @@ void ads131_start_pio_dma_capture(void) {
     sm_config_set_in_shift(&c, true, true, 32);
 
     // Configure GPIOs for PIO
-    pio_gpio_init(g_pio, ADS_PIN_SCK);
-    pio_gpio_init(g_pio, ADS_PIN_CS);
-    pio_gpio_init(g_pio, ADS_PIN_MISO);
-    pio_gpio_init(g_pio, ADS_PIN_DRDY);
+    pio_gpio_init(pio, ADS_PIN_SCK);
+    pio_gpio_init(pio, ADS_PIN_CS);
+    pio_gpio_init(pio, ADS_PIN_MISO);
+    pio_gpio_init(pio, ADS_PIN_DRDY);
 
-    pio_sm_set_consecutive_pindirs(g_pio, g_sm, ADS_PIN_SCK, 1, true);   // SCK out
-    pio_sm_set_consecutive_pindirs(g_pio, g_sm, ADS_PIN_CS,  1, true);   // CS out
-    pio_sm_set_consecutive_pindirs(g_pio, g_sm, ADS_PIN_MISO,1, false);  // MISO in
-    pio_sm_set_consecutive_pindirs(g_pio, g_sm, ADS_PIN_DRDY,1, false);  // DRDY in
+    pio_sm_set_consecutive_pindirs(pio, sm, ADS_PIN_SCK, 1, true);   // SCK out
+    pio_sm_set_consecutive_pindirs(pio, sm, ADS_PIN_CS,  1, true);   // CS out
+    pio_sm_set_consecutive_pindirs(pio, sm, ADS_PIN_MISO,1, false);  // MISO in
+    pio_sm_set_consecutive_pindirs(pio, sm, ADS_PIN_DRDY,1, false);  // DRDY in
 
-    // Set CS high initially
-    pio_sm_exec(g_pio, g_sm, pio_encode_set(pio_pins, 1));
+    // Init SM and set CS high initially (uses SET pin group)
+    pio_sm_init(pio, sm, offset, &c);
+    pio_sm_set_enabled(pio, sm, false);
+    pio_sm_exec(pio, sm, pio_encode_set(pio_pins, 1));
 
-    // Compute clock divider for ~25 MHz SCK
-    uint32_t sys_hz = clock_get_hz(clk_sys);
-    float target_sck = 25e6f;
-    float div = (float)sys_hz / (target_sck * 2.0f); // 2 instructions per bit
+    // Compute clock divider for ~25 MHz SCK (2 instructions per bit)
+    uint32_t sys_hz    = clock_get_hz(clk_sys);
+    float    target_sck = 25e6f;
+    float    div        = (float)sys_hz / (target_sck * 2.0f);
     if (div < 1.0f) div = 1.0f;
     sm_config_set_clkdiv(&c, div);
 
-    // Initialize and start SM
-    pio_sm_init(g_pio, g_sm, g_pio_offset, &c);
-    pio_sm_set_enabled(g_pio, g_sm, true);
+    // Re-init SM with final config and enable it
+    pio_sm_init(pio, sm, offset, &c);
+    pio_sm_set_enabled(pio, sm, true);
 
-    // --- DMA ping-pong setup ---
+    printf("PIO simple capture started (no DMA)...\r\n");
 
-    const uint32_t words_per_buffer = ADS131_FRAMES_PER_BUFFER * ADS131_WORDS_PER_FRAME;
+    uint64_t frame_count = 0;
+    absolute_time_t last_time = get_absolute_time();
 
-    g_dma_chan_a = dma_claim_unused_channel(true);
-    g_dma_chan_b = dma_claim_unused_channel(true);
+    uint32_t w[ADS131_WORDS_PER_FRAME];
 
-    dma_channel_config ca = dma_channel_get_default_config(g_dma_chan_a);
-    channel_config_set_transfer_data_size(&ca, DMA_SIZE_32);
-    channel_config_set_read_increment(&ca, false);
-    channel_config_set_write_increment(&ca, true);
-    channel_config_set_dreq(&ca, pio_get_dreq(g_pio, g_sm, false)); // RX FIFO
-    channel_config_set_chain_to(&ca, g_dma_chan_b);
+    while (true) {
+        // One ADS frame = 4 words (status + 4x24b packed across 4 words)
+        for (int i = 0; i < ADS131_WORDS_PER_FRAME; ++i) {
+            w[i] = pio_sm_get_blocking(pio, sm);
+        }
+        frame_count++;
 
-    dma_channel_configure(
-        g_dma_chan_a,
-        &ca,
-        g_buffers.frames[0],          // write to buffer 0
-        &g_pio->rxf[g_sm],            // read from PIO RX FIFO
-        words_per_buffer,
-        false
-    );
+        if ((frame_count & 0x3FFu) == 0) { // every 1024 frames
+            absolute_time_t now = get_absolute_time();
+            int64_t dt_us = absolute_time_diff_us(last_time, now);
+            last_time = now;
 
-    dma_channel_config cb = dma_channel_get_default_config(g_dma_chan_b);
-    channel_config_set_transfer_data_size(&cb, DMA_SIZE_32);
-    channel_config_set_read_increment(&cb, false);
-    channel_config_set_write_increment(&cb, true);
-    channel_config_set_dreq(&cb, pio_get_dreq(g_pio, g_sm, false));
-    channel_config_set_chain_to(&cb, g_dma_chan_a);
+            double rate = 0.0;
+            if (dt_us > 0) {
+                rate = (double)1024 * 1e6 / (double)dt_us;
+            }
 
-    dma_channel_configure(
-        g_dma_chan_b,
-        &cb,
-        g_buffers.frames[1],          // write to buffer 1
-        &g_pio->rxf[g_sm],
-        words_per_buffer,
-        false
-    );
-
-    // Enable DMA IRQ0 for both channels
-    dma_channel_set_irq0_enabled(g_dma_chan_a, true);
-    dma_channel_set_irq0_enabled(g_dma_chan_b, true);
-    irq_set_exclusive_handler(DMA_IRQ_0, ads131_dma_irq_handler);
-    irq_set_enabled(DMA_IRQ_0, true);
-
-    // Start DMA on channel A (it will chain A->B->A...)
-    dma_start_channel_mask(1u << g_dma_chan_a);
-
-    printf("PIO+DMA continuous capture started (ping-pong buffers)...\r\n");
+            printf("Frames=%llu  dt=%lld us  rate=%.1f SPS  "
+                   "w0=0x%08lx w1=0x%08lx w2=0x%08lx w3=0x%08lx\r\n",
+                   (unsigned long long)frame_count,
+                   (long long)dt_us,
+                   rate,
+                   (unsigned long)w[0],
+                   (unsigned long)w[1],
+                   (unsigned long)w[2],
+                   (unsigned long)w[3]);
+        }
+    }
 }

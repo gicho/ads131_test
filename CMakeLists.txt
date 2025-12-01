@@ -1,13 +1,6 @@
 cmake_minimum_required(VERSION 3.13)
 
-# Force Pico 2 / RP2350
-set(PICO_PLATFORM rp2350)
-set(PICO_BOARD pico2)
-
-if (NOT CMAKE_BUILD_TYPE)
-    set(CMAKE_BUILD_TYPE Release)
-endif()
-
+# Use PICO_SDK_PATH from environment if not provided
 if (NOT DEFINED PICO_SDK_PATH)
     if (DEFINED ENV{PICO_SDK_PATH})
         set(PICO_SDK_PATH $ENV{PICO_SDK_PATH})
@@ -44,8 +37,6 @@ target_link_libraries(ads131_test
     pico_stdlib
     hardware_spi
     hardware_pio
-    hardware_dma
-    hardware_irq
     hardware_clocks
 )
 
