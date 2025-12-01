@@ -4,14 +4,14 @@
 #include <stdint.h>
 #include <stdbool.h>
 
-// Pin mapping (same as before, but now used by PIO for data)
+// Pin mapping (Pico GPIOs)
 #define ADS_SPI_PORT   spi0
-#define ADS_PIN_MISO   16
-#define ADS_PIN_CS     17
-#define ADS_PIN_SCK    18
-#define ADS_PIN_MOSI   19
-#define ADS_PIN_DRDY   20
-#define ADS_PIN_RESET  21
+#define ADS_PIN_MISO   16   // ADC DOUT
+#define ADS_PIN_CS     17   // ADC /CS
+#define ADS_PIN_SCK    18   // ADC SCLK
+#define ADS_PIN_MOSI   19   // ADC DIN
+#define ADS_PIN_DRDY   20   // ADC /DRDY
+#define ADS_PIN_RESET  21   // ADC /RESET
 
 // Command opcodes
 #define ADS131_CMD_NULL      0x0000
@@ -46,28 +46,32 @@ typedef enum {
     ADS131_ERR_SPI
 } ads131_status_t;
 
-// Simple frame parameters for PIO+DMA:
-// We oversample 128 bits per frame -> 4x 32-bit words
+// PIO+DMA frame layout
 #define ADS131_WORDS_PER_FRAME   4
 #define ADS131_FRAMES_PER_BUFFER 1024
 #define ADS131_NUM_BUFFERS       2
 
 typedef struct {
-    // Two buffers of raw 32-bit words: [buffer][frame][word]
-    uint32_t frames[ADS131_NUM_BUFFERS][ADS131_FRAMES_PER_BUFFER][ADS131_WORDS_PER_FRAME];
+    // Raw data: [buffer][frame][word]
+    uint32_t frames[ADS131_NUM_BUFFERS]
+                   [ADS131_FRAMES_PER_BUFFER]
+                   [ADS131_WORDS_PER_FRAME];
 
-    volatile bool buffer_full[ADS131_NUM_BUFFERS];
-    volatile uint64_t total_frames;      // total frames captured
-    volatile uint64_t dma_errors;        // optional error counter
+    volatile bool     buffer_full[ADS131_NUM_BUFFERS];
+    volatile uint64_t total_frames;   // total frames captured (all buffers)
+    volatile uint64_t dma_errors;     // reserved for future use
 } ads131_frame_buffers_t;
 
-ads131_status_t ads131_init(void); // SPI-based init (reset, unlock, wakeup, CLK, channel enable)
+// SPI-based init: reset, unlock, wakeup, clock config, channel enable
+ads131_status_t ads131_init(void);
 
+// Access to global frame buffers
 ads131_frame_buffers_t *ads131_get_frame_buffers(void);
 
-void ads131_get_dma_counts(uint32_t *a_count, uint32_t *b_count);
-
-// Initialize and start PIO+DMA double-buffered capture
+// Start continuous PIO+DMA double-buffered capture
 void ads131_start_pio_dma_capture(void);
+
+// Debug helper: read remaining transfer counts for both DMA channels
+void ads131_get_dma_counts(uint32_t *a_count, uint32_t *b_count);
 
 #endif // ADS131A04_H

@@ -1,26 +1,33 @@
 .program ads131a04_capture
 .side_set 1 opt
 
+; PIO-side capture of one ADS131A04 frame (status + 4x24b = 128 bits)
+; Assumptions:
+; - SCK is sideset pin
+; - CS is in SET pin group (width=1)
+; - MISO is IN base pin
+; - DRDY is GPIO 20 (wait 0 gpio 20)
+
 .wrap_target
 wait_drdy:
-    ; Wait for DRDY (mapped as jmp_pin) to go low, keep SCK low
-    wait 0 pin 0       side 0
+    ; Wait for DRDY (GPIO20) to go low, SCK low
+    wait 0 gpio 20     side 0
 
-    ; Assert CS low (CS is on SET pin group, 1 bit wide)
+    ; Assert CS low
     set pins, 0b0      side 0
 
-    ; We want 128 bits total -> 4 chunks of 32 bits
+    ; 128 bits total -> 4 * 32-bit words
     set y, 3           ; outer loop: 4 iterations (3,2,1,0)
 outer:
     set x, 31          ; inner loop: 32 bits
 
 bitloop:
-    in pins, 1         side 1   ; SCK high, shift 1 bit from MISO
+    in pins, 1         side 1   ; SCK high, sample MISO
     nop                side 0   ; SCK low
-    jmp x-- bitloop             ; loop 32 times
+    jmp x-- bitloop             ; 32 bits/word
 
-    jmp y-- outer               ; loop 4 times (4×32 = 128 bits)
+    jmp y-- outer               ; 4 words/frame
 
-    ; After 128 bits: deassert CS
+    ; Deassert CS
     set pins, 0b1      side 0
 .wrap

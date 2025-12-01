@@ -5,7 +5,7 @@
 int main(void) {
     stdio_init_all();
 
-    // Let USB CDC come up
+    // Give USB CDC some time to enumerate
     for (int i = 0; i < 10; ++i) {
         printf("Tick %d\r\n", i);
         sleep_ms(500);
@@ -21,6 +21,9 @@ int main(void) {
     }
     printf("ads131_init() returned: OK\r\n");
 
+    printf("sleeping...\r\n");
+    sleep_ms(10);
+
     printf("Phase 2: starting PIO+DMA double-buffered capture...\r\n");
     ads131_start_pio_dma_capture();
 
@@ -30,10 +33,10 @@ int main(void) {
     absolute_time_t last_time = get_absolute_time();
 
     while (true) {
-        sleep_ms(1000);
+        sleep_ms(1);
 
         uint64_t current_total = fb->total_frames;
-        uint64_t delta_frames = current_total - last_total_frames;
+        uint64_t delta_frames  = current_total - last_total_frames;
         last_total_frames = current_total;
 
         absolute_time_t now = get_absolute_time();
@@ -45,20 +48,32 @@ int main(void) {
             rate = (double)delta_frames * 1e6 / (double)dt_us;
         }
 
-        printf("Frames: total=%llu  delta=%llu  dt=%lld us  rate=%.1f SPS  dma_errors=%llu\r\n",
+        uint32_t dmaA = 0, dmaB = 0;
+        ads131_get_dma_counts(&dmaA, &dmaB);
+
+        printf("Frames: total=%llu  delta=%llu  dt=%lld us  rate=%.1f SPS"
+               "  dma_errors=%llu  dmaA_count=%u  dmaB_count=%u\r\n",
                (unsigned long long)fb->total_frames,
                (unsigned long long)delta_frames,
                (long long)dt_us,
                rate,
-               (unsigned long long)fb->dma_errors);
+               (unsigned long long)fb->dma_errors,
+               dmaA, dmaB);
 
-        for (int b = 0; b < ADS131_NUM_BUFFERS; ++b) {
-            if (fb->buffer_full[b]) {
-                printf("Buffer %d full (contains %d frames)\r\n",
-                       b, ADS131_FRAMES_PER_BUFFER);
-                // TODO: here you can process or forward fb->frames[b][...]
-                fb->buffer_full[b] = false;
-            }
+        // Peek first few words of buffer 0/1 as a sanity check
+        if (fb->buffer_full[0]) {
+            uint32_t w0 = fb->frames[0][0][0];
+            uint32_t w1 = fb->frames[0][0][1];
+            printf("Buffer 0 full: first frame words[0]=0x%08lx words[1]=0x%08lx\r\n",
+                   (unsigned long)w0, (unsigned long)w1);
+            fb->buffer_full[0] = false;
+        }
+        if (fb->buffer_full[1]) {
+            uint32_t w0 = fb->frames[1][0][0];
+            uint32_t w1 = fb->frames[1][0][1];
+            printf("Buffer 1 full: first frame words[0]=0x%08lx words[1]=0x%08lx\r\n",
+                   (unsigned long)w0, (unsigned long)w1);
+            fb->buffer_full[1] = false;
         }
     }
 

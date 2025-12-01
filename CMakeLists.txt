@@ -18,34 +18,38 @@ endif()
 
 include(${PICO_SDK_PATH}/external/pico_sdk_import.cmake)
 
-project(ads131_dma_bench C CXX ASM)
+project(ads131_test C CXX ASM)
 
 set(CMAKE_C_STANDARD 11)
 set(CMAKE_CXX_STANDARD 17)
 
 pico_sdk_init()
 
-add_executable(ads131_dma_bench
+add_executable(ads131_test
     main.c
     ads131a04.c
+    ads131a04_capture.pio
 )
 
-pico_generate_pio_header(ads131_dma_bench ${CMAKE_CURRENT_LIST_DIR}/ads131a04_capture.pio)
+# Generate PIO header from the .pio source in the project root
+pico_generate_pio_header(ads131_test
+    ${CMAKE_CURRENT_LIST_DIR}/ads131a04_capture.pio
+)
 
-target_include_directories(ads131_dma_bench PRIVATE
+target_include_directories(ads131_test PRIVATE
     ${CMAKE_CURRENT_LIST_DIR}
 )
 
-target_link_libraries(ads131_dma_bench
+target_link_libraries(ads131_test
     pico_stdlib
     hardware_spi
-    hardware_dma
     hardware_pio
+    hardware_dma
     hardware_irq
     hardware_clocks
 )
 
-pico_enable_stdio_usb(ads131_dma_bench 1)
-pico_enable_stdio_uart(ads131_dma_bench 0)
+pico_enable_stdio_usb(ads131_test 1)
+pico_enable_stdio_uart(ads131_test 0)
 
-pico_add_extra_outputs(ads131_dma_bench)
+pico_add_extra_outputs(ads131_test)
